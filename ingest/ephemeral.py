@@ -17,10 +17,37 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
+from PIL import Image
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
+
+
+def _normalize_image_to_png_base64(raw_bytes: bytes) -> str:
+    """Decode ANY supported image format and re-encode it as PNG before it
+    is ever sent to the vision model.
+
+    Some source formats (observed: .webp) reliably cause the local vision
+    model to hang/time out even though the raw bytes are perfectly valid --
+    almost certainly an image-decoding gap in that specific model's
+    multimodal pipeline, not a SEVERANCE bug. Rather than chase every
+    format-specific quirk downstream, normalize once, here, to the one
+    format (PNG) every vision model handles reliably. Falls back to the
+    original bytes unchanged if Pillow can't decode them (e.g. an already-
+    corrupt upload) -- that failure should surface downstream as a real,
+    honest vision-analysis error, not be silently swallowed here.
+    """
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img.load()
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return base64.b64encode(raw_bytes).decode("ascii")
 
 
 def _pdf_page_to_png_base64(pdf_bytes: bytes, page_index: int, dpi: int = 200) -> str:
@@ -107,8 +134,8 @@ def parse_upload(filename: str, content: bytes, person_id: str) -> EphemeralUplo
         upload.images.append(
             EphemeralImage(
                 label=filename,
-                base64_data=base64.b64encode(content).decode("ascii"),
-                mime_type=_guess_mime(ext),
+                base64_data=_normalize_image_to_png_base64(content),
+                mime_type="image/png",
             )
         )
     elif ext == "pdf":
@@ -154,8 +181,8 @@ def parse_upload(filename: str, content: bytes, person_id: str) -> EphemeralUplo
                     upload.images.append(
                         EphemeralImage(
                             label=f"Slide {slide_idx}, Image {image_count}",
-                            base64_data=base64.b64encode(image.blob).decode("ascii"),
-                            mime_type=_guess_mime(image.ext),
+                            base64_data=_normalize_image_to_png_base64(image.blob),
+                            mime_type="image/png",
                         )
                     )
             if slide_text_parts:
