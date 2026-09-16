@@ -1,0 +1,62 @@
+services:
+  # Local LLM backend. Only reachable from `api` over the internal network.
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - severance_internal
+    # No `ports:` mapping to the host on purpose -- nothing outside this
+    # compose project can reach it either.
+    restart: unless-stopped
+
+  # SEVERANCE API + UI.
+  api:
+    build: .
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_API_BASE: "http://ollama:11434"
+      AGENT_BACKEND: "ollama"
+      SEVERANCE_DB_PATH: "/data/severance.db"
+    volumes:
+      - severance_data:/data
+      - ./corpus:/app/corpus:ro
+    ports:
+      - "8080:8080"   # the ONLY port exposed to the host machine
+    networks:
+      - severance_internal
+    restart: unless-stopped
+
+  # Sidecar that continuously watches for any outbound connection from the
+  # `api` container's network namespace to a non-private address, and
+  # writes violations to a shared log file the demo can tail live.
+  #
+  # This is the visible companion to the structural guarantee below
+  # (`severance_internal` has no route out) -- the network topology alone
+  # already makes egress impossible; this container makes that fact legible
+  # during a demo instead of asking the judges to trust an architecture
+  # diagram.
+  network-monitor:
+    build: .
+    command: ["python", "ops/network_monitor.py", "--interval", "1"]
+    network_mode: "service:api"   # shares api's network namespace, so it sees exactly what api sees
+    volumes:
+      - ./:/app
+    depends_on:
+      - api
+    restart: unless-stopped
+
+networks:
+  # internal: true is the actual sovereignty guarantee -- Docker gives this
+  # network NO default route to the host's external interface, so even a
+  # compromised or misconfigured container on it cannot reach the internet
+  # no matter what code runs inside it. This is enforced by the container
+  # runtime, not by application-level policy.
+  severance_internal:
+    driver: bridge
+    internal: true
+
+volumes:
+  ollama_models:
+  severance_data:
