@@ -1,15 +1,17 @@
-"""Administrative endpoints for account provisioning and grade management.
+"""Administrative endpoints for account provisioning, grades, and compartment assignment.
 
 ZERO ACCESS DECISIONS INSIDE.
-Admins can set pay grades. Admins CANNOT grant compartments.
-Nobody can modify their own grade.
+Admins can set pay grades and assign any compartment to another user
+(decided in auth/sponsors.py's admin_set_compartments).
+Nobody can modify their own grade or compartments.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from contracts import CreateUserRequest, Principal, UpdateGradeRequest, UserSummary
+from contracts import CreateUserRequest, Principal, SetCompartmentsRequest, UpdateGradeRequest, UserSummary
 from auth.deps import current_principal, get_db_path, require_admin
+from auth.sponsors import admin_set_compartments, load_compartment_config
 from auth.users import create_user, deactivate_user, list_users, reactivate_user, reset_password, update_grade
 
 router = APIRouter(prefix="/admin", tags=["Administration"])
@@ -135,3 +137,37 @@ def reactivate(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get("/compartments")
+def list_compartments(
+    admin: Principal = Depends(require_admin),
+):
+    """List every compartment with its description and designated sponsor."""
+    config = load_compartment_config()
+    return [
+        {"id": comp_id, "description": info.get("description", ""), "sponsor": info.get("sponsor")}
+        for comp_id, info in config.items()
+    ]
+
+
+@router.put("/users/{target_id}/compartments")
+def set_user_compartments(
+    target_id: str,
+    payload: SetCompartmentsRequest,
+    admin: Principal = Depends(require_admin),
+):
+    """Set another user's full compartment set. Self-assignment is strictly blocked."""
+    db_path = get_db_path()
+    try:
+        result = admin_set_compartments(
+            db_path=db_path,
+            actor_id=admin.person_id,
+            target_id=target_id,
+            compartments=payload.compartments,
+        )
+        return {"status": "compartments_updated", "person_id": target_id, **result}
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))

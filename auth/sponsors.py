@@ -1,12 +1,14 @@
 """Compartment ownership, sponsor authority, and delegation engine.
 
 NON-NEGOTIABLE DESIGN PRINCIPLES:
-1. Two separate powers, two separate roles:
-   - Admins provision accounts and set hierarchical pay grades.
-   - Compartment Sponsors own compartments and decide who may enter them.
-   - An admin CANNOT grant any compartment, ever.
+1. Two paths to a compartment:
+   - Compartment Sponsors own compartments and decide who may enter them
+     (grant_compartment / revoke_compartment below).
+   - An active System Administrator may assign ANY compartment set to another
+     user through the explicit admin path (admin_set_compartments below).
+     The admin cannot use the sponsor path, and cannot assign to themselves.
 2. Ownership is declared in config/compartments.json, checked in and signed off once.
-3. Only a compartment's sponsor (or authorized delegate) may grant/revoke that compartment.
+3. Outside the admin path, only a compartment's sponsor (or authorized delegate) may grant/revoke it.
 4. Owning one compartment gives ZERO authority over other compartments.
 5. NOBODY can grant compartments to themselves.
 6. Every grant/revoke action writes an immutable audit ledger entry.
@@ -342,3 +344,81 @@ def delegate_sponsor(
             "compartment": compartment.value,
         },
     )
+
+
+def admin_set_compartments(
+    db_path: str,
+    actor_id: str,
+    target_id: str,
+    compartments: list[Compartment],
+) -> dict[str, list[str]]:
+    """Replace a user's full compartment set via the System Administrator path.
+
+    Enforces:
+    - Actor must be an ACTIVE administrator, re-checked here from the user
+      store rather than trusted from the caller.
+    - Nobody can assign compartments to themselves, the admin included.
+    - Target must be an existing, active account.
+    - Every added/removed compartment is recorded in compartment_grants and
+      in one immutable ledger entry.
+
+    Returns {"compartments": [...final set...], "added": [...], "removed": [...]}.
+    """
+    if actor_id == target_id:
+        raise PermissionError(
+            "Self-assignment violation blocked: An administrator cannot assign compartments to themselves."
+        )
+
+    requested = sorted({Compartment(c).value for c in compartments})
+
+    init_grants_tables(db_path)
+    conn = get_db_connection(db_path)
+    try:
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT is_admin, is_active FROM users WHERE person_id = ?;", (actor_id,))
+            actor = cursor.fetchone()
+            if not actor or not actor["is_admin"] or not actor["is_active"]:
+                raise PermissionError(
+                    f"Unauthorized: '{actor_id}' is not an active System Administrator."
+                )
+
+            cursor.execute("SELECT compartments FROM users WHERE person_id = ? AND is_active = 1;", (target_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(f"Active target employee '{target_id}' not found.")
+
+            current = set(json.loads(row["compartments"]))
+            added = sorted(set(requested) - current)
+            removed = sorted(current - set(requested))
+            if not added and not removed:
+                return {"compartments": requested, "added": [], "removed": []}
+
+            cursor.execute(
+                "UPDATE users SET compartments = ? WHERE person_id = ?;",
+                (json.dumps(requested), target_id),
+            )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cursor.executemany(
+                """
+                INSERT INTO compartment_grants (compartment, actor_id, target_id, action, timestamp)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                [(c, actor_id, target_id, "ADMIN_GRANT", now_iso) for c in added]
+                + [(c, actor_id, target_id, "ADMIN_REVOKE", now_iso) for c in removed],
+            )
+    finally:
+        conn.close()
+
+    ledger_log(
+        db_path=db_path,
+        actor=actor_id,
+        action="ADMIN_SET_COMPARTMENTS",
+        details={
+            "subject": target_id,
+            "added": added,
+            "removed": removed,
+            "compartments": requested,
+        },
+    )
+    return {"compartments": requested, "added": added, "removed": removed}

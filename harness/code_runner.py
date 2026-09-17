@@ -83,6 +83,10 @@ def run_code_query(
     if not conversation_id:
         conversation_id = create_conversation(db_path, principal.person_id, question)
 
+    # Every earlier failure is fed back, not just the latest: with only the
+    # most recent one, the model "forgets" earlier corrections (observed:
+    # attempt 3 reverting to Java after attempt 2 was corrected for input()).
+    failures: list[str] = []
     feedback: Optional[str] = None
     last_code: str = ""
     last_result = None
@@ -93,9 +97,11 @@ def run_code_query(
             code_answer = draft_code(question, feedback=feedback)
         except Exception as exc:
             _emit({"stage": "code_drafting", "status": "error", "attempt": attempt, "message": str(exc)})
-            feedback = f"Attempt {attempt}: drafting agent raised an error ({exc})."
+            failures.append(f"Attempt {attempt}: drafting agent raised an error ({exc}).")
+            feedback = "\n\n".join(failures)
             continue
-        _emit({"stage": "code_drafting", "status": "done", "attempt": attempt})
+        _emit({"stage": "code_drafting", "status": "done", "attempt": attempt,
+               "model": getattr(agent, "last_model_used", None)})
 
         last_code = code_answer.code
         _emit({"stage": "code_execution", "status": "start", "attempt": attempt})
@@ -138,6 +144,7 @@ def run_code_query(
                 conversation_id=conversation_id,
                 code=code_answer.code,
                 code_execution=result,
+                model_used=getattr(agent, "last_model_used", None),
             )
             save_report_data(db_path=db_path, ledger_row_id=ledger_entry.row_id,
                               person_id=principal.person_id, question=question, response=response)
@@ -146,14 +153,15 @@ def run_code_query(
 
         # Feed the REAL failure back for the next attempt -- never a guess.
         reason = "timed out" if result.timed_out else f"exited with code {result.exit_code}"
-        feedback = (
+        failures.append(
             f"Attempt {attempt}: the script {reason}.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
+        feedback = "\n\n".join(failures)
 
     # Retries exhausted: ABSTAIN. Never claim code "works" that didn't exit 0.
     answer = (
         f"Response withheld: no candidate script executed successfully in the sandbox after "
-        f"{max_retries} attempts. Last failure: {feedback}"
+        f"{max_retries} attempts. Last failure: {failures[-1] if failures else 'unknown'}"
     )
     effective_label = Label(tier=Tier.PUBLIC, compartments=frozenset())
     ledger_entry = ledger_log(
@@ -172,6 +180,7 @@ def run_code_query(
         conversation_id=conversation_id,
         code=last_code or None,
         code_execution=last_result,
+        model_used=getattr(agent, "last_model_used", None),
     )
     append_turn(db_path, conversation_id, question, response)
     return response

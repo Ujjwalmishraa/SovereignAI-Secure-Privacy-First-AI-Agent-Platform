@@ -1,7 +1,9 @@
 """Unit tests for auth/sponsors.py.
 
 Verifies:
-1. An admin CANNOT grant a compartment.
+1. An admin CANNOT use the sponsor grant path (admins assign via admin_set_compartments).
+6. The admin path: admin can set any compartments on another user, never on self,
+   non-admins are rejected, and every change is ledgered.
 2. A sponsor CANNOT grant a compartment they do not own.
 3. Nobody can grant a compartment to themselves.
 4. A valid sponsor grant succeeds and writes an immutable ledger entry.
@@ -13,6 +15,7 @@ from pathlib import Path
 import pytest
 from contracts import Compartment
 from auth.sponsors import (
+    admin_set_compartments,
     grant_compartment,
     revoke_compartment,
     verify_sponsors,
@@ -45,7 +48,7 @@ def test_setup(tmp_path: Path):
 
 
 def test_admin_cannot_grant_compartment(test_setup):
-    """An administrator CANNOT grant compartments."""
+    """An administrator CANNOT use the sponsor grant path."""
     db_path, config_path = test_setup
 
     with pytest.raises(PermissionError, match="does not sponsor compartment"):
@@ -126,3 +129,44 @@ def test_missing_sponsor_fails_loudly_at_startup(tmp_path: Path):
     # No users exist in db
     with pytest.raises(RuntimeError, match="FATAL STARTUP CHECK FAILED.*legal-missing-001"):
         verify_sponsors(db_path=db_path, config_path=config_path)
+
+
+def test_admin_can_set_any_compartments_on_another_user(test_setup):
+    """The System Administrator can assign and remove ANY compartment, with ledger entries."""
+    db_path, _ = test_setup
+
+    result = admin_set_compartments(
+        db_path, "admin-01", "emp-001", [Compartment.VIGILANCE, Compartment.HSE, Compartment.LEGAL]
+    )
+    assert result["added"] == ["hse", "legal", "vigilance"]
+    assert get_principal(db_path, "emp-001").compartments == frozenset(
+        {Compartment.VIGILANCE, Compartment.HSE, Compartment.LEGAL}
+    )
+
+    result = admin_set_compartments(db_path, "admin-01", "emp-001", [Compartment.HSE])
+    assert result == {"compartments": ["hse"], "added": [], "removed": ["legal", "vigilance"]}
+    assert get_principal(db_path, "emp-001").compartments == frozenset({Compartment.HSE})
+
+    entries = [e for e in ledger_read(db_path, limit=100) if e.action == "ADMIN_SET_COMPARTMENTS"]
+    assert len(entries) == 2
+    assert entries[0].details["subject"] == "emp-001"
+
+
+def test_admin_cannot_set_own_compartments(test_setup):
+    db_path, _ = test_setup
+    with pytest.raises(PermissionError, match="cannot assign compartments to themselves"):
+        admin_set_compartments(db_path, "admin-01", "admin-01", [Compartment.VIGILANCE])
+
+
+def test_non_admin_cannot_use_admin_compartment_path(test_setup):
+    """A sponsor (non-admin) cannot use the admin path, even for their own compartment."""
+    db_path, _ = test_setup
+    with pytest.raises(PermissionError, match="not an active System Administrator"):
+        admin_set_compartments(db_path, "cvo-001", "emp-001", [Compartment.VIGILANCE])
+    assert get_principal(db_path, "emp-001").compartments == frozenset()
+
+
+def test_admin_set_compartments_unknown_target(test_setup):
+    db_path, _ = test_setup
+    with pytest.raises(ValueError, match="not found"):
+        admin_set_compartments(db_path, "admin-01", "ghost-999", [Compartment.HSE])

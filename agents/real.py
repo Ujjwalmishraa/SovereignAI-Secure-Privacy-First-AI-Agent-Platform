@@ -73,6 +73,15 @@ class RealLlmAgent:
         # Only try to auto-launch the Ollama app once per request (this agent's
         # lifetime), regardless of how many retries hit Ollama.
         self._ollama_launch_attempted = False
+        # Set after any call that actually got a response from a local model
+        # (draft/draft_code/analyze_image/draft_capability_answer) -- lets
+        # callers (harness/runner.py) report which model really produced a
+        # given answer, including a promoted fallback, for display in the UI.
+        self.last_model_used: Optional[str] = None
+        # Set only when intent classification actually got a model response;
+        # stays None when it failed open to "content" without one.
+        self.last_intent_model: Optional[str] = None
+        self.last_intent_fallback = False
 
     def classify_intent(self, question: str, recent_context: str = "") -> str:
         """Route a message BEFORE retrieval into one of three categories:
@@ -107,7 +116,12 @@ class RealLlmAgent:
             "of code, a script, a calculation done via code, or a small program -- e.g. \"write a "
             "python script that...\", \"calculate X using code\", \"run a program to...\". This is "
             "NEVER a question about document content, procedures, or the assistant's own "
-            "capabilities.\n"
+            "capabilities. This ALSO includes any request that names a programming language "
+            "(java, python, c, c++, javascript, etc.) together with a task to perform in it -- "
+            "e.g. \"print hello world in java\", \"bubble sort in java\", \"fizzbuzz in c++\" -- "
+            "even with no explicit verb like \"write\" or \"generate\": naming a programming "
+            "language IS itself the signal, since no document in this corpus contains source code "
+            "in any language.\n"
             "- \"content\": a genuine request for information that could be answered FROM A "
             "DOCUMENT -- even if short, informally phrased, or mixed in with unrelated chatter. "
             "This INCLUDES any question asking what to do, how to handle, or what the correct "
@@ -125,6 +139,11 @@ class RealLlmAgent:
             "- \"write a python script to compute the average of a list\" -> code (explicit "
             "request to generate/run code)\n"
             "- \"can you calculate 15% of 2400 using code and show the output\" -> code\n"
+            "- \"print hello world in java\" -> code (names a programming language + a task, no "
+            "document contains source code)\n"
+            "- \"bubble sort in java\" -> code (same reasoning, even with no verb at all)\n"
+            "- \"how to reverse a string in java\" -> code (\"in java\" makes this a code request, "
+            "not a real-world procedure question, even though it starts like \"how to...\")\n"
             "- \"what should I do during an emergency\" -> content (asks about a real-world "
             "procedure that a document may describe)\n"
             "- \"what can you do for me\" -> capability (asks about the assistant's own functions)\n"
@@ -160,29 +179,52 @@ class RealLlmAgent:
             )
         user_prompt += "Respond in JSON with a single field 'category', classifying the CURRENT message above."
 
+        self.last_intent_fallback = False
         raw_response = None
         if not self._ollama_unavailable:
             try:
-                # Shorter timeout than a real drafting call: this fails open to
-                # "content" on any error anyway, so waiting the full 60s for a
-                # cold/busy model just delays the fallback pointlessly.
-                raw_response = self._call_ollama(system_prompt, user_prompt, temperature=0.0, timeout=15.0)
+                # 45s, not the drafting call's 60s, but long enough to cover a
+                # cold model load: on CPU-only machines reloading an evicted
+                # model routinely takes 15-20s, and the previous 15s timeout
+                # silently failed open on the first request after a model
+                # switch -- sending coding requests into document search.
+                raw_response = self._call_ollama(system_prompt, user_prompt, temperature=0.0, timeout=45.0)
+                self.last_intent_model = self.ollama_model
             except Exception as e:
                 print(f"[RealLlmAgent] Intent classification via Ollama failed ({e}).")
 
-        if raw_response is None:
-            return "content"
+        if raw_response is not None:
+            try:
+                clean = raw_response.strip()
+                if clean.startswith("```"):
+                    clean = re.sub(r"^```(?:json)?\n?", "", clean)
+                    clean = re.sub(r"\n?```$", "", clean)
+                parsed = json.loads(clean)
+                category = str(parsed.get("category", "")).strip().lower()
+                if category in ("content", "capability", "code", "other"):
+                    return category
+            except Exception:
+                pass
 
-        try:
-            clean = raw_response.strip()
-            if clean.startswith("```"):
-                clean = re.sub(r"^```(?:json)?\n?", "", clean)
-                clean = re.sub(r"\n?```$", "", clean)
-            parsed = json.loads(clean)
-            category = str(parsed.get("category", "content")).strip().lower()
-            return category if category in ("content", "capability", "code", "other") else "content"
-        except Exception:
-            return "content"
+        self.last_intent_fallback = True
+        return self._keyword_category(question)
+
+    # A programming language name, or an action verb followed by a coding noun.
+    # Bare nouns alone ("the emergency response program", "the function of the
+    # committee") are real document-question vocabulary, so they don't count.
+    _CODE_REQUEST = re.compile(
+        r"(?:\b(?:java|javascript|typescript|python|golang|kotlin|php|ruby)\b|c\+\+|c#)"
+        r"|\b(?:write|generate|create|give me|make|implement)\b.{0,40}\b(?:program|script|code|function)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _keyword_category(cls, question: str) -> str:
+        """Deterministic fallback used only when the model gave no usable
+        classification. Still fails open to "content" for everything else --
+        it just stops an obvious coding request ("write a java program...")
+        from being searched for in refinery documents that contain no code."""
+        return "code" if cls._CODE_REQUEST.search(question) else "content"
 
     def draft_capability_answer(self, question: str, facts: str, recent_context: str = "") -> Optional[str]:
         """Answer a meta-question about the assistant/system itself in natural
@@ -224,6 +266,7 @@ class RealLlmAgent:
         if not self._ollama_unavailable:
             try:
                 raw_response = self._call_ollama(system_prompt, user_prompt)
+                self.last_model_used = self.ollama_model
             except Exception as e:
                 print(f"[RealLlmAgent] Capability answer via Ollama failed ({e}).")
 
@@ -267,22 +310,33 @@ class RealLlmAgent:
             "installed.\n"
             "3. Print the final result(s) with print() so the output is captured.\n"
             "4. Keep it minimal and correct rather than clever.\n"
-            "5. Respond STRICTLY in valid JSON with this exact schema:\n"
+            "5. ALWAYS output Python 3, even if the user's request names a different language "
+            "(Java, C, C++, JavaScript, etc.) -- the sandbox that runs this script can execute "
+            "Python ONLY, nothing else. Never write Java/C/C++/JS syntax under any circumstances. "
+            "Instead, write an equivalent Python script that solves the same underlying task, and "
+            "say so plainly in 'explanation' (e.g. \"Written in Python -- this sandbox only runs "
+            "Python; here is the same logic\").\n"
+            "6. Respond STRICTLY in valid JSON with this exact schema:\n"
             "{\n"
             '  "code": "the complete Python script as a single string, with \\n for newlines",\n'
             '  "explanation": "one or two sentences on what the script does"\n'
             "}"
         )
-        user_prompt = f"Request: {question}\n\nRespond in JSON with 'code' and 'explanation'."
+        user_prompt = (
+            f"Request: {question}\n\n"
+            "Write the solution as a Python 3 script (even if another language is named above), with no "
+            "input() calls -- use hardcoded example values. Respond in JSON with 'code' and 'explanation'."
+        )
         if feedback:
             user_prompt += (
-                f"\n\nPREVIOUS ATTEMPT FAILED WHEN RUN:\n{feedback}\n"
+                f"\n\nPREVIOUS ATTEMPTS FAILED (fix ALL of these):\n{feedback}\n"
                 "Fix the script so it actually runs successfully and produces correct output."
             )
 
         model_name = self.ollama_code_model or self.ollama_model
         try:
             raw_response = self._call_ollama(system_prompt, user_prompt, model=model_name, temperature=0.1)
+            self.last_model_used = model_name
         except Exception as e:
             print(f"[RealLlmAgent] Code drafting via Ollama ({model_name}) failed ({e}).")
             raise
@@ -303,9 +357,61 @@ class RealLlmAgent:
             code = re.sub(r"^```(?:python)?\n?|```$", "", raw_response.strip())
             explanation = ""
 
+        # The model often wraps the script in a markdown fence even INSIDE the
+        # JSON "code" string; the sandbox would then execute the literal ```
+        # characters and fail with a SyntaxError on line 1.
+        code = re.sub(r"^```[\w+-]*[ \t]*\n?", "", code)
+        code = re.sub(r"\n?```\s*$", "", code).strip()
+
         if not code:
             raise RuntimeError("Code drafting model returned no code.")
+
+        if re.search(r"(?<![\w.])input\s*\(", code):
+            # The sandbox has no stdin, so input() raises EOFError. Same
+            # reasoning as the non-Python guard below: a specific correction
+            # fixes this far more reliably than an EOFError traceback does.
+            raise RuntimeError(
+                "The script calls input(), but it runs non-interactively with no keyboard input. Rewrite it "
+                "without input(): hardcode one or two example values from the request and print the results."
+            )
+
+        non_python_marker = self._detect_non_python(code)
+        if non_python_marker:
+            # Deterministic guard: the sandbox (agents/sandbox.py) can only
+            # execute Python, but a small code-specialized model sometimes
+            # ignores the system prompt's "always Python" instruction and
+            # writes literal Java/C/C++/JS when the user names that language.
+            # Feeding back a generic Python SyntaxError traceback from a
+            # failed sandbox run rarely corrects this (observed in practice:
+            # the model repeats the same non-Python code on retry). Raising
+            # here instead gives code_runner.py's retry loop a specific,
+            # actionable correction ("you wrote Java, not Python") on the
+            # very next attempt, without spending a sandbox execution on
+            # code we already know can't run.
+            raise RuntimeError(
+                f"The response was not Python (detected '{non_python_marker}'). You MUST rewrite "
+                "the entire solution using ONLY Python 3 syntax -- `def`, `print()`, snake_case, "
+                "no curly braces, no semicolons, no 'public class', no 'System.out.println', no "
+                "'#include', no 'console.log'."
+            )
         return CodeAnswer(code=code, explanation=explanation)
+
+    @staticmethod
+    def _detect_non_python(code: str) -> Optional[str]:
+        """Cheap, deterministic substring check for the most common
+        non-Python tells (Java/C/C++/JavaScript) missed by prompt
+        instructions alone. Not exhaustive -- exists only to catch the
+        common case fast, not to be a language detector; anything it
+        misses still gets caught the normal way, by failing in the sandbox."""
+        markers = [
+            "public class ", "public static void main", "System.out.println",
+            "#include <", "using namespace ", "console.log(", "void main(",
+            "int main(", "std::", "cout <<", "cin >>",
+        ]
+        for marker in markers:
+            if marker in code:
+                return marker
+        return None
 
     def draft(
         self,
@@ -340,7 +446,11 @@ class RealLlmAgent:
             "   least one verbatim citation from a passage you examined. Never respond with 'citations': [].\n"
             "6. Every citation 'quote' must be an EXACT verbatim substring copied directly from the text —\n"
             "   never altered, summarized, or paraphrased.\n"
-            "7. Quotes must be 20-300 characters and at least 5 words.\n"
+            "7. Quotes must be 20-300 characters and at least 5 words. Give ONLY 1 or 2 citations, each a\n"
+            "   single short sentence or phrase (about 8-25 words) copied character-for-character from ONE\n"
+            "   passage. Never join words from different sentences, lines, or pages into one quote, and never\n"
+            "   reword, shorten, or fix anything inside a quote. Every citation is machine-checked and a single\n"
+            "   inexact one rejects the whole answer -- fewer exact quotes are far better than more loose ones.\n"
             "8. Read the page number ONLY from the passage's own '--- Document: <doc_id> | Page: <page> ---'\n"
             "   header. Passage text often has its own numbering (clause/schedule numbers, list entries like\n"
             "   '25. Cause of leakage...') that looks like a page number but is NOT — e.g. under a header\n"
@@ -398,6 +508,7 @@ class RealLlmAgent:
                 break
             try:
                 raw_response = self._call_ollama(system_prompt, user_prompt, model=model_name)
+                self.last_model_used = model_name
             except Exception as e:
                 if isinstance(e, httpx.TimeoutException):
                     self._ollama_unavailable = True
@@ -545,7 +656,10 @@ class RealLlmAgent:
             # response can't run out the full request timeout -- 700 tokens
             # comfortably covers an ~80-150 word answer plus a few JSON
             # citation objects, with headroom, but bounds the worst case.
-            "options": {"temperature": temperature, "num_predict": 700},
+            # num_ctx: Ollama's 4096-token default is too tight -- a 5-passage
+            # draft prompt measured ~3000 tokens before retry feedback and
+            # conversation context are appended, which would cut the JSON reply off.
+            "options": {"temperature": temperature, "num_predict": 700, "num_ctx": 8192},
         }
         with httpx.Client(timeout=timeout) as client:
             res = client.post(url, json=payload)
@@ -565,27 +679,64 @@ class RealLlmAgent:
         than routing it through harness/verify.py at all.
         """
         self._ensure_ollama_running()
-        url = f"{self.ollama_api_base}/api/chat"
+        instructed = (
+            "Answer the following question about this image as accurately and specifically "
+            "as possible, describing only what is actually visible. If the question doesn't "
+            "apply to what's shown, say so plainly.\n\nQuestion: " + question
+        )
+        # Some very small vision models (observed: moondream) emit an
+        # immediate stop token -- a 200 OK with empty content -- for the
+        # instruction-wrapped prompt, yet answer the bare question fine. Retry
+        # once with the bare question rather than silently reporting a blank
+        # observation, and raise if both come back empty so the caller shows
+        # an explicit "vision analysis failed" instead of nothing.
+        for content in (instructed, question):
+            description = self._describe_image(content, image_base64)
+            if description:
+                self.last_model_used = self.ollama_vision_model
+                return description
+        raise RuntimeError(
+            f"Vision model '{self.ollama_vision_model}' returned an empty description for this image."
+        )
+
+    # Image tokens + prompt + answer must all fit in the context window. Ollama
+    # otherwise runs models at its 4096-token default: a single phone photo can
+    # take ~3400 tokens by itself, so generation hit that limit mid-answer and
+    # the description came back cut off (observed: done_reason="length").
+    VISION_NUM_CTX = 16384
+
+    def _describe_image(self, content: str, image_base64: str) -> str:
+        """One description attempt; retries once with double the context if the
+        answer was cut off, and marks it explicitly if it is still incomplete."""
+        text, done_reason = self._call_vision(content, image_base64, num_ctx=self.VISION_NUM_CTX)
+        if done_reason != "length":
+            return text
+        retry_text, retry_reason = self._call_vision(content, image_base64, num_ctx=self.VISION_NUM_CTX * 2)
+        if len(retry_text) >= len(text):
+            text, done_reason = retry_text, retry_reason
+        if done_reason == "length" and text:
+            text += "\n\n_(Description incomplete: the vision model ran out of context for this image.)_"
+        return text
+
+    def _call_vision(self, content: str, image_base64: str, num_ctx: int) -> tuple[str, Optional[str]]:
         payload = {
             "model": self.ollama_vision_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        "Answer the following question about this image as accurately and specifically "
-                        "as possible, describing only what is actually visible. If the question doesn't "
-                        "apply to what's shown, say so plainly.\n\nQuestion: " + question
-                    ),
-                    "images": [image_base64],
-                }
-            ],
+            "messages": [{"role": "user", "content": content, "images": [image_base64]}],
             "stream": False,
-            "options": {"temperature": 0.1},
+            # Thinking-capable vision models (e.g. qwen3.5) otherwise spend most
+            # of the token budget on hidden reasoning the user never sees.
+            # Models without a thinking mode ignore this.
+            "think": False,
+            "options": {"temperature": 0.1, "num_ctx": num_ctx},
         }
         # Vision models take meaningfully longer than text-only calls (image
         # encoding + a bigger multimodal forward pass), hence the longer timeout.
-        with httpx.Client(timeout=90.0) as client:
-            res = client.post(url, json=payload)
+        with httpx.Client(timeout=180.0) as client:
+            res = client.post(f"{self.ollama_api_base}/api/chat", json=payload)
+            if res.status_code == 400 and "think" in res.text.lower():
+                # Model has no thinking mode and this Ollama rejects the flag.
+                payload.pop("think")
+                res = client.post(f"{self.ollama_api_base}/api/chat", json=payload)
             try:
                 res.raise_for_status()
             except httpx.HTTPStatusError as exc:
@@ -595,7 +746,7 @@ class RealLlmAgent:
                     response=exc.response,
                 ) from exc
             data = res.json()
-            return data["message"]["content"].strip()
+            return data["message"]["content"].strip(), data.get("done_reason")
 
     def _parse_draft(self, raw_content: str, passages: Sequence[Passage]) -> Draft:
         """Safely parse and validate structured Draft JSON."""

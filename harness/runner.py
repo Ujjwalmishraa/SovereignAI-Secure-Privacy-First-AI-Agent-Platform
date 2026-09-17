@@ -41,6 +41,16 @@ from trust.reports import save_report_data
 
 DEFAULT_MAX_RETRIES = 3
 
+# Without this, a small model told only "citation N failed" tends to re-guess
+# a different wording of the same shaky quote on every retry. Dropping it is
+# always an acceptable fix, since verification still applies in full to
+# whatever citations remain.
+_CITATION_RETRY_HINT = (
+    "If you cannot reproduce a quote character-for-character from the exact page header it appeared "
+    "under, REMOVE that citation instead of guessing again -- keep only the 1-2 quotes you are certain "
+    "are exact, and limit the answer to what those quotes support."
+)
+
 
 def _build_capability_facts(corpus: Sequence[Passage], principal: Principal) -> tuple[str, list[str], list[str]]:
     """Ground-truth facts about this assistant's real behavior and the
@@ -189,7 +199,13 @@ def run_query(
             category = classify_intent(question, recent_context)
         except Exception:
             category = "content"  # fail open
-        _emit({"stage": "intent", "status": "done", "category": category})
+        _emit({
+            "stage": "intent",
+            "status": "done",
+            "category": category,
+            "model": getattr(agent, "last_intent_model", None),
+            "fallback": getattr(agent, "last_intent_fallback", False),
+        })
 
         if category == "other":
             answer = (
@@ -247,7 +263,7 @@ def run_query(
                     answer = None
             if not answer:
                 answer = _build_capability_fallback_answer(readable, locked)
-            _emit({"stage": "capability", "status": "done"})
+            _emit({"stage": "capability", "status": "done", "model": getattr(agent, "last_model_used", None)})
             effective_label = Label(tier=Tier.PUBLIC, compartments=frozenset())
             ledger_entry = ledger_log(
                 db_path=db_path,
@@ -267,6 +283,7 @@ def run_query(
                 effective_label=effective_label,
                 ledger_row_id=ledger_entry.row_id,
                 conversation_id=conversation_id,
+                model_used=getattr(agent, "last_model_used", None),
             )
             save_report_data(
                 db_path=db_path,
@@ -279,13 +296,14 @@ def run_query(
             return response
 
     # Step 1: Two-pass retrieval and gating
-    _emit({"stage": "retrieval", "status": "start"})
+    retrieval_mode = os.getenv("SEVERANCE_RETRIEVAL_MODE", "lexical")
+    _emit({"stage": "retrieval", "status": "start", "mode": retrieval_mode})
     allowed_passages, denials = retrieve(
         query=question,
         corpus=corpus,
         principal=principal,
         top_k=request.top_k,
-        use_semantic=os.getenv("SEVERANCE_RETRIEVAL_MODE", "lexical") == "semantic",
+        use_semantic=retrieval_mode == "semantic",
     )
     _emit({
         "stage": "retrieval",
@@ -348,7 +366,7 @@ def run_query(
             _emit({"stage": "drafting", "status": "error", "attempt": attempt, "message": str(exc)})
             feedback = f"Attempt {attempt} failed: drafting agent raised an error ({exc})."
             continue
-        _emit({"stage": "drafting", "status": "done", "attempt": attempt, "citations_claimed": len(draft.citations)})
+        _emit({"stage": "drafting", "status": "done", "attempt": attempt, "citations_claimed": len(draft.citations), "model": getattr(agent, "last_model_used", None)})
 
         # Pure Python string verification
         _emit({"stage": "verification", "status": "start", "attempt": attempt})
@@ -362,7 +380,11 @@ def run_query(
         _emit({"stage": "verification", "status": "fail", "attempt": attempt, "reason": failure})
         # Feed the precise failure reason back into the next attempt
         avail_str = ", ".join(f"doc_id='{p.doc_id}' page {p.page}" for p in allowed_passages)
-        feedback = f"Attempt {attempt} verification failed: {failure}. Note: The ONLY readable passages in context are [{avail_str}]. Ensure all quotes are exact verbatim substrings and page numbers match these exactly."
+        feedback = (
+            f"Attempt {attempt} verification failed: {failure}. Note: The ONLY readable passages in context are "
+            f"[{avail_str}]. Ensure all quotes are exact verbatim substrings and page numbers match these exactly. "
+            f"{_CITATION_RETRY_HINT}"
+        )
 
     # Step 4: Outcome Resolution & Classification Inheritance
     if successful_draft is not None:
@@ -389,6 +411,7 @@ def run_query(
             effective_label=effective_label,
             ledger_row_id=ledger_entry.row_id,
             conversation_id=conversation_id,
+            model_used=getattr(agent, "last_model_used", None),
         )
         # Persist the FULL answer/citations/denials for report regeneration.
         # The ledger entry above only carries a truncated preview (it's readable
@@ -429,6 +452,7 @@ def run_query(
             effective_label=effective_label,
             ledger_row_id=ledger_entry.row_id,
             conversation_id=conversation_id,
+            model_used=getattr(agent, "last_model_used", None),
         )
         append_turn(db_path, conversation_id, question, response)
         return response
@@ -468,7 +492,48 @@ def run_ephemeral_query(
         conversation_id = create_conversation(db_path, principal.person_id, question)
 
     answer_sections: list[str] = []
+    visual_sections: list[str] = []
     text_citations: list[Citation] = []
+
+    # The upload was already split into text pages/slides and images when it was
+    # received (ingest/ephemeral.py); report that as the extraction step.
+    _emit({
+        "stage": "extraction",
+        "status": "done",
+        "filename": upload.filename,
+        "text_chunks": len(upload.text_chunks),
+        "images": len(upload.images),
+    })
+
+    # --- Image channel: vision model, explicitly and visibly unverified ---
+    # Runs BEFORE the text channel so live progress only moves forward (the text
+    # channel ends in citation verification). Section order in the final answer
+    # is unchanged: visual_sections are appended after the text findings below.
+    analyze_image = getattr(agent, "analyze_image", None)
+    if upload.images and analyze_image is not None:
+        observations: list[str] = []
+        for image in upload.images:
+            _emit({"stage": "vision", "status": "start", "label": image.label})
+            try:
+                description = analyze_image(question, image.base64_data)
+                _emit({"stage": "vision", "status": "done", "label": image.label,
+                       "model": getattr(agent, "last_model_used", None)})
+            except Exception as exc:
+                description = f"(Vision analysis failed: {exc})"
+                _emit({"stage": "vision", "status": "error", "label": image.label, "message": str(exc)})
+            observations.append(f"**{image.label}:** {description}")
+
+        visual_sections.append(
+            "## Visual Observations (AI-Described — Not Verbatim-Verified)\n\n"
+            "The following are the vision model's own descriptions of the image content. Unlike the text "
+            "findings above, these cannot be checked against an exact source string and should be treated "
+            "as an aid, not a verified fact.\n\n" + "\n\n".join(observations)
+        )
+    elif upload.images and analyze_image is None:
+        visual_sections.append(
+            "## Visual Observations\n\nThis upload contains images, but the active agent backend does not "
+            "support image analysis."
+        )
 
     # --- Text channel: identical citation-verification discipline as governed content ---
     if upload.text_chunks:
@@ -493,7 +558,7 @@ def run_ephemeral_query(
                 _emit({"stage": "drafting", "status": "error", "attempt": attempt, "message": str(exc)})
                 feedback = f"Attempt {attempt} failed: drafting agent raised an error ({exc})."
                 continue
-            _emit({"stage": "drafting", "status": "done", "attempt": attempt, "citations_claimed": len(draft.citations)})
+            _emit({"stage": "drafting", "status": "done", "attempt": attempt, "citations_claimed": len(draft.citations), "model": getattr(agent, "last_model_used", None)})
 
             _emit({"stage": "verification", "status": "start", "attempt": attempt})
             failure = verify_check(draft.citations, passages)
@@ -506,7 +571,7 @@ def run_ephemeral_query(
             feedback = (
                 f"Attempt {attempt} verification failed: {failure}. Note: The ONLY readable passages in "
                 f"context are [{avail_str}]. Ensure all quotes are exact verbatim substrings and page "
-                f"numbers match these exactly."
+                f"numbers match these exactly. {_CITATION_RETRY_HINT}"
             )
 
         if successful_draft is not None:
@@ -518,30 +583,7 @@ def run_ephemeral_query(
                 "verbatim against the uploaded text, so no text-based finding is reported."
             )
 
-    # --- Image channel: vision model, explicitly and visibly unverified ---
-    analyze_image = getattr(agent, "analyze_image", None)
-    if upload.images and analyze_image is not None:
-        observations: list[str] = []
-        for image in upload.images:
-            _emit({"stage": "vision", "status": "start", "label": image.label})
-            try:
-                description = analyze_image(question, image.base64_data)
-            except Exception as exc:
-                description = f"(Vision analysis failed: {exc})"
-            _emit({"stage": "vision", "status": "done", "label": image.label})
-            observations.append(f"**{image.label}:** {description}")
-
-        answer_sections.append(
-            "## Visual Observations (AI-Described — Not Verbatim-Verified)\n\n"
-            "The following are the vision model's own descriptions of the image content. Unlike the text "
-            "findings above, these cannot be checked against an exact source string and should be treated "
-            "as an aid, not a verified fact.\n\n" + "\n\n".join(observations)
-        )
-    elif upload.images and analyze_image is None:
-        answer_sections.append(
-            "## Visual Observations\n\nThis upload contains images, but the active agent backend does not "
-            "support image analysis."
-        )
+    answer_sections.extend(visual_sections)
 
     answer = "\n\n".join(answer_sections) if answer_sections else "The uploaded file contained no analyzable text or images."
 
@@ -567,6 +609,7 @@ def run_ephemeral_query(
         effective_label=effective_label,
         ledger_row_id=ledger_entry.row_id,
         conversation_id=conversation_id,
+        model_used=getattr(agent, "last_model_used", None),
     )
     save_report_data(
         db_path=db_path,

@@ -9,6 +9,15 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env before any other project module reads os.getenv() at import or
+# call time (e.g. agents/real.py's model names, AGENT_BACKEND) -- otherwise
+# every setting in .env is silently ignored and callers only ever see
+# hardcoded defaults.
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
@@ -22,10 +31,13 @@ from ingest.seed import seed_initial_admin
 from trust.conversations import init_conversations_table
 from trust.ledger import init_ledger_table
 from trust.reports import init_reports_table
-from api.routes import admin, ask, auth, conversations, documents, grants, ledger
+from api.routes import admin, ask, auth, conversations, documents, grants, ledger, models
 
 UI_DIR = Path(__file__).parent.parent / "ui"
 STATIC_DIR = UI_DIR / "static"
+
+# React SPA build output (used when ui-react/dist exists)
+REACT_DIR = Path(__file__).parent.parent / "ui-react" / "dist"
 
 
 @asynccontextmanager
@@ -93,6 +105,7 @@ app.include_router(grants.router)
 app.include_router(ask.router)
 app.include_router(documents.router)
 app.include_router(ledger.router)
+app.include_router(models.router)
 app.include_router(conversations.router)
 
 
@@ -105,40 +118,97 @@ def get_current_user_profile(
 
 
 # ---------------------------------------------------------------------------
-# HTML UI Routes
+# HTML UI Routes — React SPA (primary) with legacy fallback
 # ---------------------------------------------------------------------------
+
+# Mount React SPA static assets if build exists
+if REACT_DIR.exists():
+    _react_assets = REACT_DIR / "assets"
+    if _react_assets.exists():
+        app.mount("/assets", StaticFiles(directory=str(_react_assets)), name="react-assets")
+
+
+def _serve_react_index():
+    """Serve the React SPA index.html for client-side routing."""
+    index_path = REACT_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(str(index_path))
+    return None
+
 
 @app.get("/")
 def index(request: Request):
-    """Redirect to /app if authenticated, otherwise to /login."""
+    """Redirect to /workbench if authenticated, otherwise to /login."""
     token = request.cookies.get(COOKIE_NAME)
     if token and verify_session_token(token):
+        # If React build exists, redirect to /workbench (SPA route)
+        if REACT_DIR.exists():
+            return RedirectResponse(url="/workbench")
         return RedirectResponse(url="/app")
     return RedirectResponse(url="/login")
 
 
 @app.get("/login")
 def login_page():
-    """Serve authentication UI."""
+    """Serve authentication UI (React SPA or legacy)."""
+    react = _serve_react_index()
+    if react:
+        return react
     login_path = UI_DIR / "login.html"
     return FileResponse(str(login_path))
 
 
 @app.get("/app")
 def app_page(request: Request):
-    """Serve main workbench UI."""
+    """Serve main workbench UI (legacy)."""
     token = request.cookies.get(COOKIE_NAME)
     if not token or not verify_session_token(token):
         return RedirectResponse(url="/login")
+    react = _serve_react_index()
+    if react:
+        return react
     app_path = UI_DIR / "app.html"
     return FileResponse(str(app_path))
 
 
+# React SPA client-side routes. Some share a path with a JSON API endpoint
+# (/documents, /models), so a plain @app.get route here would never be
+# reached -- the API router registered above matches first, and reloading
+# those pages showed raw JSON. Instead, route by intent: a browser page load
+# sends Accept: text/html and gets the SPA; the frontend's fetch() calls don't,
+# and fall through to the API as before.
+_SPA_ROUTES = {
+    "/workbench", "/sovereignty", "/knowledge-base", "/models",
+    "/documents", "/generated-outputs", "/profile",
+}
+
+
+@app.middleware("http")
+async def serve_spa_on_html_navigation(request: Request, call_next):
+    if (
+        request.method == "GET"
+        and request.url.path in _SPA_ROUTES
+        and "text/html" in request.headers.get("accept", "")
+    ):
+        token = request.cookies.get(COOKIE_NAME)
+        if not token or not verify_session_token(token):
+            return RedirectResponse(url="/login")
+        react = _serve_react_index()
+        if react:
+            return react
+        return RedirectResponse(url="/app")
+    return await call_next(request)
+
+
 @app.get("/admin")
 def admin_page(request: Request):
-    """Serve administrative and sponsor console UI."""
+    """Serve administrative console (React SPA or legacy)."""
     token = request.cookies.get(COOKIE_NAME)
     if not token or not verify_session_token(token):
         return RedirectResponse(url="/login")
+    react = _serve_react_index()
+    if react:
+        return react
     admin_path = UI_DIR / "admin.html"
     return FileResponse(str(admin_path))
+

@@ -80,7 +80,7 @@ def test_auth_login_and_me(api_client):
 
 
 def test_admin_provisioning_and_separation_of_powers(api_client):
-    """Admin provisions user, but CANNOT grant compartments."""
+    """Admin provisions user, but CANNOT use the sponsor /grants path."""
     client, _ = api_client
 
     # 1. Login as admin
@@ -107,6 +107,39 @@ def test_admin_provisioning_and_separation_of_powers(api_client):
     assert grant_res.status_code == 403
     assert "does not sponsor compartment" in grant_res.json()["detail"]
 
+
+
+def test_admin_assigns_compartments_via_admin_api(api_client):
+    """Only the System Administrator can use PUT /admin/users/{id}/compartments, never on self."""
+    client, _ = api_client
+
+    client.post("/auth/login", json={"person_id": "admin-root", "password": "RootAdmin123!"})
+    comps = client.get("/admin/compartments")
+    assert comps.status_code == 200
+    assert {c["id"] for c in comps.json()} >= {"vigilance", "hse"}
+
+    res = client.put("/admin/users/cvo-001/compartments", json={"compartments": ["vigilance", "hse"]})
+    assert res.status_code == 200
+    assert res.json()["added"] == ["hse", "vigilance"]
+
+    users = {u["person_id"]: u for u in client.get("/admin/users").json()}
+    assert sorted(users["cvo-001"]["compartments"]) == ["hse", "vigilance"]
+
+    self_res = client.put("/admin/users/admin-root/compartments", json={"compartments": ["hse"]})
+    assert self_res.status_code == 403
+
+    bad = client.put("/admin/users/cvo-001/compartments", json={"compartments": ["not-a-compartment"]})
+    assert bad.status_code == 422
+
+    missing = client.put("/admin/users/nobody-1/compartments", json={"compartments": ["hse"]})
+    assert missing.status_code == 404
+
+    # A non-admin (even a sponsor) is rejected by the endpoint itself.
+    client.post("/auth/logout")
+    client.post("/auth/login", json={"person_id": "cvo-001", "password": "CVOPassword123!"})
+    forbidden = client.put("/admin/users/admin-root/compartments", json={"compartments": ["vigilance"]})
+    assert forbidden.status_code == 403
+    assert client.get("/admin/compartments").status_code == 403
 
 def test_sponsor_grant_and_ask_query(api_client):
     """Sponsor grants compartment, user runs /ask query and downloads report."""

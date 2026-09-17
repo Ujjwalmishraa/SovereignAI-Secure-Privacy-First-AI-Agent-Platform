@@ -149,8 +149,13 @@ def list_conversations(db_path: str, person_id: str) -> list[dict[str, Any]]:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT conversation_id, title, created_at, updated_at FROM conversations "
-            "WHERE person_id = ? ORDER BY updated_at DESC;",
+            "SELECT c.conversation_id, c.title, c.created_at, c.updated_at, "
+            "COUNT(t.id) AS turn_count "
+            "FROM conversations c "
+            "LEFT JOIN conversation_turns t ON t.conversation_id = c.conversation_id "
+            "WHERE c.person_id = ? "
+            "GROUP BY c.conversation_id "
+            "ORDER BY c.updated_at DESC;",
             (person_id,),
         )
         return [
@@ -159,6 +164,7 @@ def list_conversations(db_path: str, person_id: str) -> list[dict[str, Any]]:
                 "title": r["title"],
                 "created_at": r["created_at"],
                 "updated_at": r["updated_at"],
+                "turn_count": r["turn_count"],
             }
             for r in cursor.fetchall()
         ]

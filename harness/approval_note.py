@@ -116,6 +116,14 @@ def generate_approval_note(
     verified_findings: list[Citation] = []
     findings_text_parts: list[str] = []
 
+    _emit({
+        "stage": "extraction",
+        "status": "done",
+        "filename": upload.filename,
+        "text_chunks": len(upload.text_chunks),
+        "images": len(upload.images),
+    })
+
     # --- Channel 1: text-layer pages -> citation-verified findings extraction ---
     if upload.text_chunks:
         passages = [
@@ -139,15 +147,22 @@ def generate_approval_note(
             try:
                 draft = agent.draft(question=findings_question, passages=passages, feedback=feedback)
             except Exception as exc:
+                _emit({"stage": "approval_note_drafting", "status": "error", "attempt": attempt, "message": str(exc)})
                 feedback = f"Attempt {attempt} failed: drafting agent raised an error ({exc})."
                 continue
             failure = verify_check(draft.citations, passages)
             if failure is None:
-                _emit({"stage": "approval_note_drafting", "status": "pass", "attempt": attempt})
+                _emit({"stage": "approval_note_drafting", "status": "pass", "attempt": attempt,
+                       "model": getattr(agent, "last_model_used", None)})
                 successful_draft = draft
                 break
-            _emit({"stage": "approval_note_drafting", "status": "fail", "attempt": attempt, "reason": failure})
-            feedback = f"Attempt {attempt} verification failed: {failure}."
+            _emit({"stage": "approval_note_drafting", "status": "fail", "attempt": attempt, "reason": failure,
+                   "model": getattr(agent, "last_model_used", None)})
+            feedback = (
+                f"Attempt {attempt} verification failed: {failure}. If you cannot reproduce a quote "
+                "character-for-character, REMOVE that citation instead of guessing again -- keep only "
+                "quotes you are certain are exact."
+            )
 
         if successful_draft is not None:
             findings_text_parts.append(successful_draft.answer)
@@ -165,9 +180,11 @@ def generate_approval_note(
             _emit({"stage": "vision", "status": "start", "label": image.label})
             try:
                 description = analyze_image(vision_question, image.base64_data)
+                _emit({"stage": "vision", "status": "done", "label": image.label,
+                       "model": getattr(agent, "last_model_used", None)})
             except Exception as exc:
                 description = f"(Vision analysis failed: {exc})"
-            _emit({"stage": "vision", "status": "done", "label": image.label})
+                _emit({"stage": "vision", "status": "error", "label": image.label, "message": str(exc)})
             visual_observations.append(f"{image.label}: {description}")
         findings_text_parts.append(
             "Unverified visual observations:\n" + "\n".join(visual_observations)
@@ -177,7 +194,8 @@ def generate_approval_note(
 
     _emit({"stage": "approval_note_synthesis", "status": "start"})
     title, summary, recommendation = _synthesize_note_fields(agent, findings_text, upload.filename)
-    _emit({"stage": "approval_note_synthesis", "status": "done"})
+    _emit({"stage": "approval_note_synthesis", "status": "done",
+           "model": getattr(agent, "ollama_model", None) if hasattr(agent, "_call_ollama") else None})
 
     note = ApprovalNote(
         title=title,
@@ -218,6 +236,7 @@ def generate_approval_note(
         ledger_row_id=ledger_entry.row_id,
         conversation_id=conversation_id,
         approval_note=note,
+        model_used=getattr(agent, "last_model_used", None),
     )
     save_report_data(db_path=db_path, ledger_row_id=ledger_entry.row_id,
                       person_id=principal.person_id, question=question, response=response)

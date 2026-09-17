@@ -86,6 +86,10 @@ def test_load_corpus_empty_or_missing_dir(tmp_path: Path):
 def test_ocr_fallback_recovers_text_from_image_only_pdf():
     """A PDF with no embedded text layer, but real text baked into the image,
     should be recovered via OCR when enable_ocr=True."""
+    import pytest
+    # OCR is an opt-in feature (SEVERANCE_ENABLE_OCR) backed by an optional,
+    # heavyweight dependency that isn't in requirements.txt.
+    pytest.importorskip("paddleocr")
     from ingest.pdf import pdf_to_page_texts
     pages = pdf_to_page_texts("tests/fixtures/scanned_real_text.pdf", enable_ocr=True)
     assert any("Assembly" in p or "Gate" in p for p in pages)

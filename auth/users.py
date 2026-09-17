@@ -2,7 +2,8 @@
 
 NON-NEGOTIABLE DESIGN PRINCIPLES:
 1. Nobody self-registers. Accounts are provisioned exclusively by administrators.
-2. Admins set pay grades; admins CANNOT grant compartments.
+2. Admins set pay grades, and may assign compartments to OTHER users only
+   through auth/sponsors.py's admin_set_compartments.
 3. Nobody can modify their own grade, compartments, or admin status.
 4. Passwords hashed using hashlib.scrypt with a per-user random salt.
 5. Deactivation is a boolean flag, preserving audit ledger referential integrity.
@@ -88,7 +89,7 @@ def create_user(
     """Provision a new employee record.
 
     Admins can set the initial pay grade.
-    Admins CANNOT assign compartments.
+    Compartments are never set here; see auth/sponsors.py.
     Returns (user_record, cleartext_temporary_password).
     """
     init_users_table(db_path)

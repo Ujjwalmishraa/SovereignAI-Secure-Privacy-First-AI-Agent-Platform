@@ -235,6 +235,15 @@ class AskResponse(BaseModel):
             "general Q&A path."
         ),
     )
+    model_used: Optional[str] = Field(
+        default=None,
+        description=(
+            "Local Ollama model that actually produced this answer (e.g. the drafting model, "
+            "a promoted fallback model, the code model, or the vision model), as reported by "
+            "the agent. None when no model call was made at all (immediate abstention, or the "
+            "MockAgent backend)."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +370,13 @@ class RevokeCompartmentRequest(BaseModel):
     """Payload to revoke a compartment (sponsor of that compartment only, never self)."""
     person_id: str = Field(description="Target employee whose clearance is being revoked")
     compartment: Compartment = Field(description="Compartment to revoke")
+
+
+class SetCompartmentsRequest(BaseModel):
+    """Payload for the System Administrator to set a user's full compartment set (never self)."""
+    compartments: list[Compartment] = Field(
+        description="The complete set of compartments the target should hold; anything not listed is removed"
+    )
 
 
 class ChangePasswordRequest(BaseModel):

@@ -24,6 +24,7 @@ class MockAgent:
         self.fail_always = fail_always
         self.custom_answer = custom_answer
         self.calls = 0
+        self.last_model_used = "mock-agent"
 
     def draft(
         self,
