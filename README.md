@@ -6,13 +6,30 @@
 
 ## 1. The Thesis
 
-SEVERANCE is a sovereign, air-gapped agentic document workbench built for Mangalore Refinery and Petrochemicals Limited (MRPL) that automates Section 10 of India's Right to Information (RTI) Act 2005 ("Severability") at the passage level. Grounded in the absolute principle that **the model proposes, the code disposes**, every access decision, two-axis security gate, citation verification, and audit entry is enforced by deterministic Python code before any prompt is assembled. By strictly decoupling hierarchical rank from orthogonal compartments and discarding denied text at the retrieval boundary, SEVERANCE mathematically guarantees that high seniority never leaks compartmentalized intelligence, hallucinations cannot survive verbatim span verification, and withheld secrets are physically absent from model context.
+SEVERANCE is a sovereign, air-gapped agentic document workbench built for Mangalore Refinery and Petrochemicals Limited (MRPL) that automates Section 10 of India's Right to Information (RTI) Act 2005 ("Severability") at the passage level. Grounded in the principle that **the model proposes, the code disposes**, every access decision, two-axis security gate, citation verification, and audit entry is enforced by deterministic Python code — never by a model. Hierarchical rank is decoupled from orthogonal compartments, denied text is discarded at the retrieval boundary before any prompt is assembled, and every quoted citation must match the source verbatim or the answer is withheld.
+
+All language, code, vision, and embedding models run **locally through Ollama**. There is no cloud LLM fallback anywhere in the codebase: document and question content never leaves the machine.
 
 ---
 
-## 2. System Architecture & Request Path
+## 2. What the Workbench Does
 
-The pipeline strictly separates deterministic verification code from stochastic model generation. There is exactly one LLM interaction, and it is strictly bounded by deterministic pre-retrieval gating and post-generation span verification.
+| Capability | How it works |
+|---|---|
+| **Document Q&A** | Classifies the request, searches the corpus (semantic or lexical), gates every passage through the two-axis access check, drafts an answer with a local model, and verifies every citation verbatim before returning it. |
+| **Code requests** | Routed to a dedicated local code model; the script is executed in a sandboxed subprocess and only returned if it actually runs. Requests naming Java/C++/etc. are answered with an equivalent Python script (the sandbox runs Python only). |
+| **File & image analysis** | Upload a PDF, PowerPoint, or image. Text pages go through the same citation-verified drafting; images are described by a local vision model and clearly labeled as unverified observations. |
+| **Approval notes** | From an uploaded inspection report, extracts verified findings, adds visual observations, and drafts a formal approval note downloadable as Word. |
+| **Reports** | Every answered query can be downloaded as DOCX, PPTX, or XLSX with classification stamping. |
+| **Conversation memory** | Follow-up questions continue the same conversation, so "that" and "it" resolve against the last turns. History is persisted per user. |
+| **Audit ledger** | Every query, grant, and account change is appended to a SHA-256 hash-chained ledger that can be verified from the UI. |
+| **Live transparency** | The UI shows each pipeline step as it happens (Scan → Extract → Consult → Draft), which agent is running, and which local model it is using. |
+
+---
+
+## 3. System Architecture & Request Path
+
+The pipeline strictly separates deterministic code from stochastic model generation. Models are only ever called with passages the caller is cleared to read, and nothing they produce is trusted until deterministic code has checked it.
 
 ```mermaid
 flowchart TD
@@ -20,45 +37,49 @@ flowchart TD
     classDef stoch fill:#7c2d12,stroke:#ef4444,stroke-width:2px,color:#f9fafb;
     classDef data fill:#111827,stroke:#10b981,stroke-width:2px,color:#f9fafb;
 
-    Client([User Request /ask]):::data --> AuthCookie[Extract Signed Session Cookie]:::det
-    AuthCookie --> ResolvePrincipal[Resolve Principal from SQLite Store\nGrade & Compartments Verified]:::det
-    ResolvePrincipal --> ScoreCorpus[Pass 1: Score ALL Corpus Passages\nRank agnostic of labels]:::det
+    Client([User Request /ask/stream]):::data --> AuthCookie[Verify Signed Session Cookie]:::det
+    AuthCookie --> ResolvePrincipal[Resolve Principal from SQLite\nGrade & Compartments]:::det
+    ResolvePrincipal --> Intent[Intent Router\nlocal model, keyword fallback]:::stoch
+    Intent -->|code| CodePath[Code Agent drafts Python\nSandbox executes it\nretry with real error, max 3]:::stoch
+    Intent -->|capability| Capability[Answer from real system\nand access facts]:::det
+    Intent -->|other| AbstainOther[Abstain: not a question]:::det
+    Intent -->|content| ScoreCorpus[Pass 1: Score ALL passages\nsemantic or lexical]:::det
+
     ScoreCorpus --> TwoAxisGate{Pass 2: Two-Axis Gate\ncan_read principal, label}:::det
+    TwoAxisGate -->|Allowed| AllowedPile[Allowed Passages\nFull Text]:::data
+    TwoAxisGate -->|Denied| DeniedPile[Denied Passages\nTEXT DISCARDED\nDoc ID + Reason Only]:::data
 
-    TwoAxisGate -->|Allowed Passages| AllowedPile[Allowed Passages Pile\nRetains Full Text]:::data
-    TwoAxisGate -->|Denied Passages| DeniedPile[Denied Passages Pile\nTEXT DISCARDED\nDoc ID + Reason Only]:::data
+    AllowedPile --> CheckEmpty{Readable matches?}:::det
+    CheckEmpty -->|None| AbstainImmediate[Abstain Immediately\nModel is NOT called]:::det
+    CheckEmpty -->|Top-K| AssemblePrompt[Assemble Prompt\nAllowed passages only]:::det
 
-    AllowedPile --> CheckEmpty{Readable matches\nfound?}:::det
-    CheckEmpty -->|No: Zero matches| AbstainImmediate[Abstain Immediately\nModel is NOT called\nName withheld doc titles]:::det
-    CheckEmpty -->|Yes: Top-K matches| AssemblePrompt[Assemble Prompt\nAllowed passages only]:::det
-
-    subgraph StochasticBoundary [Stochastic Generation Boundary]
-        AssemblePrompt --> LLMCall[Drafting Agent ADK / Mock\nProposes Draft Answer +\nStructured Citations]:::stoch
+    subgraph StochasticBoundary [Stochastic Generation Boundary - local Ollama only]
+        AssemblePrompt --> LLMCall[Drafting Agent\nprimary model, fallback model]:::stoch
     end
 
-    LLMCall --> StructuredValidation{Pydantic Schema Check\nMin 20 chars, min 5 words}:::det
-    StructuredValidation -->|Fails Schema| RetryLoop
-    StructuredValidation -->|Passes Schema| CitationVerify{Citation Verification\nExact verbatim substring match\nin exact doc_id AND page}:::det
+    LLMCall --> CitationVerify{Citation Verification\nVerbatim substring in exact\ndoc_id AND page}:::det
+    CitationVerify -->|Failed| RetryLoop{Retry cap reached?\nmax 3 attempts}:::det
+    RetryLoop -->|No| Feedback[Feed exact failure reason\ninto next draft]:::det
+    Feedback --> LLMCall
+    RetryLoop -->|Yes| AbstainFailedVerify[Abstain\nNever return unverified answer]:::det
 
-    CitationVerify -->|Verification Failed| RetryLoop{Retry Cap Reached?\nMax 3 Attempts}:::det
-    RetryLoop -->|Under Cap| FeedFeedback[Feed specific mismatch reason\ninto next draft prompt]:::det
-    FeedFeedback --> LLMCall
-    RetryLoop -->|Cap Exceeded| AbstainFailedVerify[Abstain With Failure\nNever return unverified answer]:::det
-
-    CitationVerify -->|Verification Passed| InheritLabel[Inherit Classification\nHighest Tier + Union of Compartments\nof ALL passages placed in prompt]:::det
-
-    InheritLabel --> AppendLedger[Append to Hash-Chained Ledger\nSHA-256 prev_hash link]:::det
-    AppendLedger --> StampResponse[3-Way Classification Stamping\nBanner, Header/Footer, Filename]:::det
-    StampResponse --> FinalOutput([Return AskResponse + Denials + Citations]):::data
+    CitationVerify -->|Passed| InheritLabel[Inherit Classification\nHighest tier + union of compartments\nof ALL prompt passages]:::det
+    InheritLabel --> AppendLedger[Append to Hash-Chained Ledger]:::det
+    CodePath --> AppendLedger
+    Capability --> AppendLedger
+    AbstainOther --> AppendLedger
     AbstainImmediate --> AppendLedger
     AbstainFailedVerify --> AppendLedger
+    AppendLedger --> FinalOutput([Stream stage events + final AskResponse\nanswer, citations, denials, model_used]):::data
 ```
+
+Every stage boundary is streamed to the browser as newline-delimited JSON (`POST /ask/stream`), which is what drives the live activity log and step indicator in the UI.
 
 ---
 
-## 3. The Two-Axis Access Control Model
+## 4. The Two-Axis Access Control Model
 
-Access is evaluated on two orthogonal axes. **Both axes must satisfy the criteria independently.** High hierarchical rank grants no compartment visibility.
+Access is evaluated on two orthogonal axes. **Both must pass independently.** High rank grants no compartment visibility.
 
 ```mermaid
 flowchart LR
@@ -79,8 +100,8 @@ flowchart LR
         G_C["Grade C: Senior Manager (Rank 9)"]:::axis1
         G_B["Grade B: Manager (Rank 8)"]:::axis1
         G_A["Grade A: Executive / AM (Rank 7)"]:::axis1
-        G_JM["Non-Management JM1-JM6 (Ranks 4-6)"]:::axis1
-        G_S["Non-Management S1-S4 (Ranks 1-3)"]:::axis1
+        G_JM["Non-Management JM1-JM6 / TS1-TS6"]:::axis1
+        G_S["Non-Management S1-S4"]:::axis1
     end
 
     subgraph Axis2 [Axis 2: Compartments - Independent Unranked Sets]
@@ -117,11 +138,13 @@ flowchart LR
     end
 ```
 
+Tier floors: `public` 0, `internal` 1, `confidential` 7, `secret` 11.
+
 ---
 
-## 4. The Permission Model: Separation of Powers
+## 5. The Permission Model
 
-Account provisioning and compartment administration are strictly segregated. Nobody can modify their own clearance or compartments.
+Nobody can modify their own grade, compartments, or account status, and every change is written to the audit ledger.
 
 ```mermaid
 flowchart TD
@@ -130,191 +153,233 @@ flowchart TD
     classDef employee fill:#374151,stroke:#9ca3af,stroke-width:2px,color:#ffffff;
     classDef blocked fill:#881337,stroke:#f43f5e,stroke-width:2px,color:#ffffff;
 
-    AdminUser["Admin (HR / Sysadmin)\nis_admin = True"]:::admin
+    AdminUser["System Administrator\nis_admin = True"]:::admin
     CVO["Sponsor: vigilance\nChief Vigilance Officer (cvo-001)"]:::sponsor
     HeadSafety["Sponsor: hse\nHead of Safety (safety-001)"]:::sponsor
-    GMUser["General Manager\nGrade F (Rank 12)\nNeither Admin nor Sponsor"]:::employee
-    TargetEmployee["Target Employee\n(e.g., Process Engineer)"]:::employee
+    TargetEmployee["Target Employee"]:::employee
 
-    subgraph AdminPowers [Admin Powers]
-        AdminUser -->|Can Create| NewAccount[Create User Account]:::admin
-        AdminUser -->|Can Set| SetGrade[Assign Grade A-I, S1-S4]:::admin
-        AdminUser -->|Can Deactivate| Deactivate[Deactivate Account]:::admin
-        AdminUser -.->|CANNOT GRANT| BlockedComp[Any Compartment]:::blocked
+    subgraph AdminPowers [Administrator Powers - Admin page]
+        AdminUser -->|Create / reset password| NewAccount[Provision Accounts]:::admin
+        AdminUser -->|Set| SetGrade[Assign Pay Grade]:::admin
+        AdminUser -->|Toggle| Deactivate[Deactivate / Reactivate]:::admin
+        AdminUser -->|Grant / revoke ANY| AdminComp[Compartment Access Control table]:::admin
     end
 
     subgraph SponsorPowers [Sponsor Powers - config/compartments.json]
-        CVO -->|Can Grant/Revoke ONLY| GrantVig[Grant vigilance Compartment]:::sponsor
-        HeadSafety -->|Can Grant/Revoke ONLY| GrantHSE[Grant hse Compartment]:::sponsor
-        CVO -.->|CANNOT GRANT| BlockedHSE[hse, legal, commercial, tech]:::blocked
+        CVO -->|Grant/Revoke ONLY| GrantVig[vigilance]:::sponsor
+        HeadSafety -->|Grant/Revoke ONLY| GrantHSE[hse]:::sponsor
+        CVO -.->|CANNOT GRANT| BlockedHSE[hse, legal, commercial, technical]:::blocked
     end
 
-    subgraph SelfGrantRule [The Golden Rule: Self-Modification Blocked]
-        AdminUser -.->|Blocked in Code| AdminSelf[Cannot edit own Grade or Admin status]:::blocked
-        CVO -.->|Blocked in Code| CVOSelf[Cannot grant vigilance to self]:::blocked
-        GMUser -.->|Zero Grant Powers| NoGrant[Cannot grant any clearance to anyone]:::blocked
+    subgraph SelfRule [Self-Modification Blocked in Code]
+        AdminUser -.-> AdminSelf[Cannot change own grade,\ncompartments, or status]:::blocked
+        CVO -.-> CVOSelf[Cannot grant vigilance to self]:::blocked
     end
 
     SetGrade --> TargetEmployee
+    AdminComp --> TargetEmployee
     GrantVig --> TargetEmployee
     GrantHSE --> TargetEmployee
 
-    subgraph AuditTrail [Immutable Audit Trail]
-        SetGrade ==> Ledger[(Hash-Chained Ledger\nActor, Subject, Action, Timestamp)]:::admin
-        GrantVig ==> Ledger
-        GrantHSE ==> Ledger
-    end
+    SetGrade ==> Ledger[(Hash-Chained Ledger)]:::admin
+    AdminComp ==> Ledger
+    GrantVig ==> Ledger
+    GrantHSE ==> Ledger
 ```
+
+- **Sponsors** (declared in `config/compartments.json`) may grant and revoke only their own compartment, and never to themselves. Sponsorship does not grant read access to the sponsor.
+- **The System Administrator** can assign any set of compartments to any *other* active user from the **Compartment Access Control** table (`PUT /admin/users/{id}/compartments`). Each save records exactly what was added and removed in the ledger.
+- Being a sponsor is separate from being able to read a compartment: `cvo-001` can grant `vigilance` to others, but needs it granted (by the administrator) to read vigilance documents.
 
 ---
 
-## 5. File Tree & Purpose
+## 6. The Local Models
+
+| Role | Default model | Used for |
+|---|---|---|
+| Primary | `gemma3:4b` | Intent routing, document answers, capability answers, approval notes |
+| Fallback | `qwen3.5:2b-q4_K_M` | Tried automatically if the primary model produces no citations |
+| Vision | `qwen3.5:2b-q4_K_M` | Describing uploaded images and scanned pages |
+| Code | `qwen2.5-coder:3b` | Writing Python scripts for code requests |
+| Embeddings | `nomic-embed-text` | Semantic retrieval (`SEVERANCE_RETRIEVAL_MODE=semantic`) |
+
+Any locally installed Ollama models can be substituted through `.env`. The **Models** page shows which configured models are actually installed, and highlights the one the agent is using right now.
+
+---
+
+## 7. The Web UI
+
+The React UI (`ui-react/`) is served by FastAPI from its production build in `ui-react/dist`.
+
+| Page | Purpose |
+|---|---|
+| **Workbench** | Ask questions, attach files, draft approval notes, download reports. Shows the live Scan → Extract → Consult → Draft steps, a live agent activity log (agent, model, outcome, timing), and the model in use. |
+| **Sovereignty** | Browse the audit ledger and verify the hash chain. |
+| **Knowledge Base** / **Documents** | Corpus statistics and per-user readability of every document, with the exact denial reason. |
+| **Models** | Configured local models, install status, and the live active model. |
+| **Generated Outputs** | Conversation history with rename, delete, and report downloads. |
+| **Administration** | Provision users, reset passwords, set grades, activate/deactivate, and assign compartments (admin); grant/revoke own compartment (sponsors). |
+| **Profile** | Account details, clearances, and password change. |
+
+---
+
+## 8. Project Structure
 
 ```
-SEVERANCE4/
-├── contracts.py              # Shared Pydantic shapes & enums — the only cross-file vocabulary
-├── API.md                    # Detailed documentation for all REST API endpoints
-├── README.md                 # System thesis, architecture, permission model, and operational guide
-├── requirements.txt          # Minimal Python dependencies (FastAPI, pydantic, pypdf, python-docx)
-├── .env.example              # Template environment configuration
-│
-├── trust/
-│   ├── __init__.py
-│   ├── labels.py             # Pure security engine: RANK, TIER_FLOOR, can_read(), inherit_label()
-│   └── ledger.py             # SHA-256 hash-chained SQLite audit ledger with verify() and tamper()
-│
-├── auth/
-│   ├── __init__.py
-│   ├── users.py              # User store, password hashing (scrypt), account provisioning
-│   ├── sponsors.py           # Compartment ownership & delegation engine (sponsors grant own only)
-│   ├── session.py            # HMAC-SHA256 signed session tokens & HttpOnly cookie handlers
-│   └── deps.py               # FastAPI auth dependencies (current_principal, require_admin, etc.)
-│
-├── config/
-│   └── compartments.json     # Declarative compartment sponsor manifest (signed off once)
-│
-├── harness/
-│   ├── __init__.py
-│   ├── retrieve.py           # Two-pass retrieval: score all candidates, gate, discard denied text
-│   ├── runner.py             # Bounded verification loop: call agent, verify citations, retry/abstain
-│   └── verify.py             # Pure Python string span verifier: exact match on doc_id and page
-│
-├── agents/
-│   ├── __init__.py
-│   ├── base.py               # Agent Protocol and Draft structured schema (no clearance in signature)
-│   ├── mock.py               # Deterministic canned agent for air-gapped testing and deterministic retry
-│   └── adk.py                # Google ADK LlmAgent adapter with exactly 4 security-gated tools
-│
-├── ingest/
-│   ├── __init__.py
-│   ├── pdf.py                # Page-level PDF extraction with loud ScannedPdfError detection
-│   └── seed.py               # First-run bootstrap service for initial administrator
-│
-├── deliver/
-│   ├── __init__.py
-│   └── docx.py               # Word report builder with 3-way redundant classification stamping
+sih2/
+├── contracts.py               # Shared Pydantic shapes & enums — the cross-file vocabulary
+├── API.md                     # REST API reference
+├── requirements.txt           # Python dependencies
+├── .env.example               # Environment template
+├── Dockerfile / docker-compose.yml
 │
 ├── api/
-│   ├── __init__.py
-│   ├── main.py               # FastAPI entrypoint, lifecycle hooks, and static file mounting
+│   ├── main.py                # FastAPI app, .env loading, startup checks, React SPA serving
 │   └── routes/
-│       ├── __init__.py
-│       ├── auth.py           # Authentication endpoints (login, logout, change-password, /me)
-│       ├── admin.py          # Admin endpoints for user provisioning and grade assignments
-│       ├── ask.py            # Primary query workbench endpoint (/ask)
-│       ├── documents.py      # Corpus browsing endpoint with per-user readability flags
-│       └── ledger.py         # Audit trail inspection and tamper-verification endpoints
+│       ├── auth.py            # login, logout, change-password
+│       ├── admin.py           # users, grades, password reset, activation, compartment assignment
+│       ├── grants.py          # sponsor grant/revoke, /grants/mine
+│       ├── ask.py             # /ask, /ask/stream, uploads, approval notes, report downloads
+│       ├── documents.py       # corpus listing with per-user readability
+│       ├── conversations.py   # persisted conversation history
+│       ├── ledger.py          # audit ledger read & chain verification
+│       └── models.py          # configured local models + install status
 │
-├── ui/
-│   ├── login.html            # Authentication interface with mandatory first-login password reset
-│   ├── app.html              # Main workbench UI with user chip, ask panel, denials, citations
-│   ├── admin.html            # Role-segregated admin & compartment sponsor management console
-│   └── static/
-│       ├── style.css         # Clean dark-themed CSS styling
-│       └── app.js            # Vanilla JS workbench controller
+├── agents/
+│   ├── base.py                # Agent protocol (no principal/clearance in the signature)
+│   ├── real.py                # Local Ollama agent: intent routing, drafting, code, vision
+│   ├── sandbox.py             # Subprocess code execution with timeout & limits
+│   ├── mock.py                # Deterministic offline agent for tests
+│   └── adk.py                 # Google ADK adapter (optional)
 │
-├── corpus/
-│   ├── manifest.json         # Document security labels metadata
-│   ├── README.md             # Corpus management guide for refinery documentation
-│   └── documents/
-│       └── .gitkeep          # Repository for refinery PDF documents
+├── harness/
+│   ├── runner.py              # Query lifecycle: route, retrieve, draft, verify, retry, abstain
+│   ├── code_runner.py         # Code request loop: draft, execute, feed back real errors
+│   ├── approval_note.py       # Inspection report -> verified findings -> approval note
+│   ├── retrieve.py            # Two-pass retrieval: score everything, gate, discard denied text
+│   ├── semantic.py            # Embedding-based scoring via local Ollama
+│   └── verify.py              # Deterministic verbatim citation verifier
 │
-├── scripts/
-│   └── create_admin.py       # Bootstrap-code-gated CLI for emergency admin creation
+├── trust/
+│   ├── labels.py              # RANK, TIER_FLOOR, can_read(), inherit_label()
+│   ├── ledger.py              # SHA-256 hash-chained audit ledger
+│   ├── conversations.py       # Per-user conversation store & recent-turn context
+│   └── reports.py             # Full answer storage for report regeneration
 │
-└── tests/
-    ├── __init__.py
-    ├── fixtures/             # Tiny synthetic test PDFs (standard, scanned/blank, mixed)
-    ├── test_labels.py        # Unit tests for two-axis access control and label inheritance
-    ├── test_ledger.py        # Unit tests for hash chaining, tampering detection, and audit queries
-    ├── test_auth.py          # Unit tests for session verification and client forgery immunity
-    ├── test_sponsors.py      # Unit tests for sponsor separation of powers and self-grant prevention
-    ├── test_retrieve.py      # Unit tests for two-pass retrieval, ranking, and text discarding
-    ├── test_verify.py        # Unit tests for exact quote span matching and schema rejection
-    ├── test_runner.py        # Unit tests for the retry loop and deterministic abstention
-    └── test_mock.py          # Unit tests for the MockAgent implementation
+├── auth/
+│   ├── users.py               # scrypt password hashing, provisioning, grades
+│   ├── sponsors.py            # Sponsor grants, delegation, admin compartment assignment
+│   ├── session.py             # HMAC-SHA256 signed session cookies
+│   └── deps.py                # FastAPI auth dependencies
+│
+├── ingest/
+│   ├── pdf.py                 # Page-level PDF extraction (optional OCR)
+│   ├── ephemeral.py           # In-memory per-user uploads: PDF, PPTX, images
+│   └── seed.py                # First-run administrator bootstrap
+│
+├── deliver/                   # DOCX, PPTX, XLSX reports and approval-note DOCX
+├── config/compartments.json   # Compartment -> sponsor declaration
+├── corpus/                    # manifest.json (labels) + documents/ (PDFs)
+├── ops/network_monitor.py     # Live outbound-connection monitor for demos
+├── scripts/                   # create_admin, create_employee, grant_compartment, fixtures
+├── tests/                     # pytest suite
+├── ui-react/                  # React + Vite + Tailwind frontend (src/ and built dist/)
+└── ui/                        # Legacy static HTML UI (used only if ui-react/dist is absent)
 ```
 
 ---
 
-## 6. Setup and Run Instructions
+## 9. Setup and Run
 
 ### Prerequisites
 - Python 3.11+
-- SQLite 3
+- [Ollama](https://ollama.com) running locally
+- Node.js 18+ (only if you want to rebuild or develop the frontend — a production build is already committed)
 
-### Step 1: Environment Configuration
-Create a local `.env` file from the example:
+### Step 1: Pull the local models
+```bash
+ollama pull gemma3:4b
+ollama pull qwen3.5:2b-q4_K_M
+ollama pull qwen2.5-coder:3b
+ollama pull nomic-embed-text
+```
+
+### Step 2: Configure the environment
 ```bash
 cp .env.example .env
 ```
-Edit `.env` to configure your initial administrative credentials and secrets:
+Key settings in `.env`:
 ```ini
-SEVERANCE_ENV=development
 SEVERANCE_SECRET_KEY=change-this-in-production-to-a-secure-random-token
 SEVERANCE_ADMIN_ID=admin-001
 SEVERANCE_ADMIN_PASSWORD=InitialAdminPassword123!
-SEVERANCE_BOOTSTRAP_CODE=mrpl-sih-2026-bootstrap-key
 SEVERANCE_DB_PATH=severance.db
-AGENT_BACKEND=mock # Use 'mock' for offline testing, 'adk' for Google ADK
-```
 
-### Step 2: Virtual Environment & Dependencies
+AGENT_BACKEND=ollama              # 'ollama' (local), 'mock' (offline canned), or 'adk'
+OLLAMA_API_BASE=http://localhost:11434
+OLLAMA_MODEL=gemma3:4b
+OLLAMA_FALLBACK_MODEL=qwen3.5:2b-q4_K_M
+OLLAMA_VISION_MODEL=qwen3.5:2b-q4_K_M
+OLLAMA_CODE_MODEL=qwen2.5-coder:3b
+
+SEVERANCE_RETRIEVAL_MODE=semantic # or 'lexical' (no embedding model needed)
+SEVERANCE_ENABLE_OCR=false        # 'true' requires the optional paddleocr package
+SANDBOX_TIMEOUT_SECONDS=8
+CONVERSATION_MEMORY_TURNS=2
+```
+`.env` is loaded automatically at startup. Changing the secret key invalidates existing login sessions.
+
+### Step 3: Install Python dependencies
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python -m venv venv
+# Windows: venv\Scripts\activate    macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Step 3: Run the Test Suite
-Execute the entire test suite to verify the security core in isolation:
+### Step 4: Run the test suite
 ```bash
-pytest -v tests/
+python -m pytest tests/
 ```
 
-### Step 4: Start the Server
-Launch the FastAPI server:
+### Step 5: Start the server
 ```bash
-uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8080
 ```
-Navigate to `http://127.0.0.1:8000/` in your browser. The application will automatically seed the initial admin user on first startup.
+Open **http://localhost:8080**. On first startup the database is created and the administrator account from `.env` is seeded.
 
-### Step 5: Bootstrap Ordering
-1. Log in as `admin-001`. You will be prompted to change your temporary password.
-2. In the Admin console, create the sponsor accounts declared in `config/compartments.json`:
-   - `cvo-001` (Chief Vigilance Officer)
-   - `safety-001` (Head of Safety)
-   - `legal-001` (Company Secretary)
-   - `comm-001` (GM Commercial)
-   - `tech-001` (GM Technical)
-3. Log out and log in as any sponsor (e.g., `cvo-001`) to grant compartment clearances to personnel.
+### Step 6: Create the sponsor accounts
+Startup warns until every sponsor in `config/compartments.json` exists. Log in as `admin-001`, open **Administration** (top-right menu), and create:
+
+| Employee ID | Role | Sponsors |
+|---|---|---|
+| `cvo-001` | Chief Vigilance Officer | vigilance |
+| `safety-001` | Head of Safety | hse |
+| `legal-001` | Company Secretary | legal |
+| `comm-001` | GM Commercial | commercial |
+| `tech-001` | GM Technical | technical |
+
+Each gets a temporary password to change on first login. Alternatively, from the command line:
+```bash
+python scripts/create_employee.py --id cvo-001 --name "Chief Vigilance Officer" --job-title "Chief Vigilance Officer" --grade H --password "YourPassword123!"
+```
+Then grant compartments from the **Compartment Access Control** table (administrator) or by logging in as a sponsor.
+
+### Frontend development (optional)
+```bash
+cd ui-react
+npm install
+npm run dev      # http://localhost:3000, proxies API calls to :8080
+npm run build    # rebuilds ui-react/dist, served by FastAPI
+```
 
 ---
 
-## 7. What is Not Built Yet (Honest Engineering Boundaries)
+## 10. Honest Engineering Boundaries
 
-1. **Semantic Vector Embeddings**: Retrieval currently uses a deterministic, air-gapped lexical BM25/keyword scoring engine. Dense vector embeddings (e.g. via local ONNX or sentence-transformers) can be dropped in without changing the two-axis gate, as the gate operates on candidates after scoring regardless of score provenance.
-2. **Optical Character Recognition (OCR)**: Scanned PDFs lacking an embedded text layer are deliberately flagged and rejected with a loud `ScannedPdfError` rather than routed to an OCR pipeline. This prevents silent OCR degradation or hallucination on critical engineering diagrams.
-3. **Multi-Node Byzantine Distributed Ledger**: The audit ledger is an immutable, hash-chained SQLite table local to the node. While mathematically tamper-evident (any record modification breaks the cryptographic SHA-256 chain), it is not a multi-master distributed consensus network.
-4. **Hardware Security Module (HSM) Signing**: Session tokens are signed using standard library HMAC-SHA256 with an ephemeral/configured secret key, rather than hardware-backed PKCS#11 cryptographic smartcards.
-5. **Real MRPL Internal Documents**: By design, genuine MRPL operational records are confidential. The repository contains a structured manifest and placeholder scaffolding. Authorized MRPL administrators add real refinery PDFs directly to `corpus/documents/`.
+1. **Docker deployment is not yet verified.** `Dockerfile` and `docker-compose.yml` exist (with an `internal: true` network intended to make outbound traffic impossible), but they have not been run end to end. The compose file does not yet pass the model settings above, and an internal-only network can prevent the UI port from being published. Local development runs directly on the host.
+2. **The code sandbox is process-level, not container-level.** Generated scripts run in a separate Python subprocess with a stripped environment and a wall-clock timeout. The memory limit applies only on Linux/macOS, and the subprocess is not blocked from the network or from reading host files. Full isolation requires running each execution in its own locked-down container.
+3. **Small local models are imperfect.** Answers that cannot be verified verbatim are withheld rather than shown — for noisy scanned sources (e.g. documents with OCR typos) this means some questions correctly return "Response withheld" instead of an answer.
+4. **OCR is optional.** Scanned PDFs without a text layer are rejected with `ScannedPdfError` unless `SEVERANCE_ENABLE_OCR=true` and `paddleocr` is installed. Uploaded scans can still be read by the vision model, with its output labeled unverified.
+5. **Uploads are ephemeral.** Uploaded files are held in memory per user and are lost on server restart.
+6. **Single-node ledger.** The audit ledger is tamper-evident (any modification breaks the SHA-256 chain) but is a local SQLite table, not a distributed ledger. Session tokens are HMAC-signed with a configured secret, not hardware-backed.
+7. **Real MRPL documents are not included.** The repository ships a labeled manifest and sample PDFs; authorized administrators add real documents to `corpus/documents/` and label them in `corpus/manifest.json`.
